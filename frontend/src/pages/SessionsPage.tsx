@@ -19,6 +19,7 @@ import TableContainer from '@mui/material/TableContainer';
 import TableHead from '@mui/material/TableHead';
 import TableRow from '@mui/material/TableRow';
 import TextField from '@mui/material/TextField';
+import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import StatusChip from '../components/common/StatusChip';
 import ConflictBadge from '../components/common/ConflictBadge';
@@ -29,8 +30,9 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
+import { FILTER_NAMES, SESSION_STATUSES, type ObsSession, type SessionStatus } from '../types';
 import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
+import { summarizeExecution, validateExecution, type ExecutionInput } from '../utils/execution';
 
 interface SessionFormState {
   nightId: string;
@@ -45,7 +47,63 @@ interface SessionFormState {
   rescheduleReason: string;
 }
 
-/** 排程段列表与冲突检测结果，支持批量改期到备用观测夜 */
+/** 执行登记表单：结束时间与有效帧数都留空时即「进行中，只登记开始时间」 */
+type ExecutionFormState = ExecutionInput;
+
+/** 执行登记单元格：未登记显式标注，绝不以计划帧数顶替 */
+function ExecutionCell({ session }: { session: ObsSession }) {
+  const summary = useMemo(() => summarizeExecution(session), [session]);
+  const record = session.execution;
+
+  if (summary.unregistered) {
+    return (
+      <Chip
+        size="small"
+        variant="outlined"
+        label={session.status === '因云取消' ? '未登记（已改期）' : '未登记'}
+        color={session.status === '因云取消' ? 'default' : 'warning'}
+      />
+    );
+  }
+
+  if (summary.ongoing) {
+    return (
+      <Stack spacing={0.25}>
+        <Chip size="small" color="primary" label="进行中" />
+        <Typography variant="caption" color="text.secondary">
+          实际开始 {record?.actualStartTime}，结束/帧数待补
+        </Typography>
+      </Stack>
+    );
+  }
+
+  return (
+    <Stack spacing={0.25}>
+      <Stack direction="row" spacing={0.5} alignItems="center" flexWrap="wrap">
+        <Chip
+          size="small"
+          color={summary.framesShort ? 'warning' : 'success'}
+          label={summary.framesShort ? `短拍 ${record?.validFrames}/${session.plannedFrames}` : `${record?.validFrames}/${session.plannedFrames} 帧`}
+        />
+        {summary.frameShortfall < 0 ? <Chip size="small" variant="outlined" color="success" label={`超 ${-summary.frameShortfall}`} /> : null}
+        {summary.missingShortReason ? <Chip size="small" color="error" label="缺短拍原因" /> : null}
+      </Stack>
+      <Typography variant="caption" color="text.secondary">
+        {record?.actualStartTime}-{record?.actualEndTime}（实际 {formatMinutes(summary.actualDuration ?? 0)}
+        {summary.endedEarly ? ` · 提前 ${formatMinutes(summary.plannedDuration - (summary.actualDuration ?? 0))}` : ''}）
+      </Typography>
+      {record?.shortReason ? (
+        <Tooltip title={record.shortReason}>
+          <Typography variant="caption" color="warning.main" sx={{ display: 'block', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            原因：{record.shortReason}
+          </Typography>
+        </Tooltip>
+      ) : null}
+    </Stack>
+  );
+}
+
+/** 排程段列表与冲突检测结果，支持批量改期到备用观测夜与执行登记 */
 export default function SessionsPage() {
   usePersistentStore();
   const sessions = useSessionStore((s) => s.sessions);
@@ -53,6 +111,8 @@ export default function SessionsPage() {
   const updateSession = useSessionStore((s) => s.updateSession);
   const removeSession = useSessionStore((s) => s.removeSession);
   const rescheduleToBackup = useSessionStore((s) => s.rescheduleToBackup);
+  const registerExecution = useSessionStore((s) => s.registerExecution);
+  const clearExecution = useSessionStore((s) => s.clearExecution);
   const nights = useNightStore((s) => s.nights);
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
@@ -74,6 +134,10 @@ export default function SessionsPage() {
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
   const [rescheduleNight, setRescheduleNight] = useState('');
   const [rescheduleReason, setRescheduleReason] = useState('');
+  const [execDialogOpen, setExecDialogOpen] = useState(false);
+  const [execSessionId, setExecSessionId] = useState('');
+  const [execError, setExecError] = useState('');
+  const [execForm, setExecForm] = useState<ExecutionFormState>({ actualStartTime: '', actualEndTime: '', validFrames: '', shortReason: '' });
   const [form, setForm] = useState<SessionFormState>({
     nightId: '',
     targetId: '',
@@ -89,6 +153,7 @@ export default function SessionsPage() {
 
   const conflictSet = useMemo(() => conflictIds(), [conflictIds]);
   const backupNights = useMemo(() => nights.filter((night) => night.backup), [nights]);
+  const execSession = sessions.find((session) => session.id === execSessionId);
 
   const visible = useMemo(() => {
     return [...sessions]
@@ -116,6 +181,12 @@ export default function SessionsPage() {
       ignoreSessionId: editingId || undefined,
     });
   }, [dialogOpen, findConflicts, form.nightId, form.telescopeId, form.startTime, form.endTime, editingId]);
+
+  /** 登记弹窗内实时预览短拍 / 提前结束提示 */
+  const execPreview = useMemo(() => {
+    if (!execDialogOpen || !execSession) return null;
+    return validateExecution(execSession, execForm);
+  }, [execDialogOpen, execSession, execForm]);
 
   function openCreate() {
     setEditingId('');
@@ -172,8 +243,9 @@ export default function SessionsPage() {
       return;
     }
     if (editingId) {
+      // 不传 execution：updateSession 会保留已登记的执行结果
       await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已更新排程段');
+      setNotice('已更新排程段，已有执行登记结果保留不变');
     } else {
       await addSession({ ...form, rescheduleReason: form.rescheduleReason });
       setNotice('已新增排程段');
@@ -193,13 +265,55 @@ export default function SessionsPage() {
     setRescheduleReason('');
   }
 
+  function openRegister(id: string) {
+    const session = sessions.find((item) => item.id === id);
+    if (!session) return;
+    setExecSessionId(id);
+    setExecError('');
+    const record = session.execution;
+    setExecForm({
+      // 开始时间默认取已登记值，否则取计划开始时间，仍可修改
+      actualStartTime: record?.actualStartTime ?? session.startTime,
+      // 结束/帧数仅在已有完成登记时回显；未登记时留空，避免把计划值当成实际结果直接保存
+      actualEndTime: record?.actualEndTime ?? '',
+      validFrames: typeof record?.validFrames === 'number' ? String(record.validFrames) : '',
+      shortReason: record?.shortReason ?? '',
+    });
+    setExecDialogOpen(true);
+  }
+
+  async function submitExecution() {
+    if (!execSession) return;
+    const result = validateExecution(execSession, execForm);
+    if (!result.ok || !result.record) {
+      setExecError(result.error);
+      return;
+    }
+    await registerExecution(execSession.id, result.record, result.finished);
+    setExecDialogOpen(false);
+    if (!result.finished) {
+      setNotice('已登记实际开始时间，该段标记为进行中，结束时间与有效帧数可观测后补录');
+    } else if (result.short) {
+      setNotice('已登记执行结果：帧数不足或提前结束，短拍原因已记录');
+    } else {
+      setNotice('已登记执行结果');
+    }
+  }
+
+  async function handleClearExecution(id: string) {
+    await clearExecution(id);
+    setNotice('已清除该段执行登记，状态回退为待执行');
+  }
+
+  const editingSession = sessions.find((session) => session.id === editingId);
+
   return (
     <Box>
       <Typography variant="h5" sx={{ mb: 0.5 }}>
         排程段列表与冲突检测
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        同一时段同一望远镜重复排入即进入冲突列表；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。
+        同一时段同一望远镜重复排入即进入冲突列表；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。观测后请在「执行登记」补录实际开始/结束与有效帧数，进行中的段可先只登记开始时间。
       </Typography>
 
       {notice ? (
@@ -242,7 +356,7 @@ export default function SessionsPage() {
       </Stack>
 
       <TableContainer component={Paper} variant="outlined">
-        <Table size="small">
+        <Table size="small" sx={{ minWidth: 1360 }}>
           <TableHead>
             <TableRow>
               <TableCell padding="checkbox">
@@ -253,12 +367,13 @@ export default function SessionsPage() {
                 />
               </TableCell>
               <TableCell>观测夜</TableCell>
-              <TableCell>时段</TableCell>
+              <TableCell>计划时段</TableCell>
               <TableCell>目标</TableCell>
               <TableCell>望远镜 / 终端</TableCell>
               <TableCell>滤镜</TableCell>
-              <TableCell align="right">帧数</TableCell>
-              <TableCell>状态</TableCell>
+              <TableCell align="right">计划帧数</TableCell>
+              <TableCell>排程状态</TableCell>
+              <TableCell sx={{ minWidth: 230 }}>执行登记（实际时段 / 有效帧数）</TableCell>
               <TableCell>冲突</TableCell>
               <TableCell>改期原因</TableCell>
               <TableCell align="right">操作</TableCell>
@@ -273,6 +388,7 @@ export default function SessionsPage() {
                 endTime: session.endTime,
                 ignoreSessionId: session.id,
               });
+              const cancelled = session.status === '因云取消';
               return (
                 <TableRow
                   key={session.id}
@@ -306,6 +422,9 @@ export default function SessionsPage() {
                     <StatusChip status={session.status} />
                   </TableCell>
                   <TableCell>
+                    <ExecutionCell session={session} />
+                  </TableCell>
+                  <TableCell>
                     <ConflictBadge conflicts={conflicts} compact />
                   </TableCell>
                   <TableCell>
@@ -321,16 +440,39 @@ export default function SessionsPage() {
                     ) : null}
                   </TableCell>
                   <TableCell align="right">
-                    <Button size="small" onClick={() => openEdit(session.id)}>
-                      编辑
-                    </Button>
-                    <Button size="small" color="error" onClick={() => void removeSession(session.id)}>
-                      删除
-                    </Button>
+                    <Stack direction="row" spacing={0.5} justifyContent="flex-end" flexWrap="wrap">
+                      <Tooltip title={cancelled ? '已因云取消改期，无需执行登记' : session.execution ? '修改 / 补全执行登记' : '登记实际开始、结束与有效帧数'}>
+                        <span>
+                          <Button size="small" variant={session.execution ? 'text' : 'outlined'} disabled={cancelled} onClick={() => openRegister(session.id)}>
+                            {session.execution ? '补录' : '登记'}
+                          </Button>
+                        </span>
+                      </Tooltip>
+                      <Button size="small" onClick={() => openEdit(session.id)}>
+                        编辑
+                      </Button>
+                      {session.execution ? (
+                        <Button size="small" color="warning" onClick={() => void handleClearExecution(session.id)}>
+                          清除登记
+                        </Button>
+                      ) : null}
+                      <Button size="small" color="error" onClick={() => void removeSession(session.id)}>
+                        删除
+                      </Button>
+                    </Stack>
                   </TableCell>
                 </TableRow>
               );
             })}
+            {visible.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={12} align="center">
+                  <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>
+                    当前筛选条件下暂无排程段
+                  </Typography>
+                </TableCell>
+              </TableRow>
+            ) : null}
           </TableBody>
         </Table>
       </TableContainer>
@@ -341,6 +483,13 @@ export default function SessionsPage() {
           {error ? (
             <Alert severity="error" sx={{ mb: 1.5 }}>
               {error}
+            </Alert>
+          ) : null}
+          {editingSession?.execution ? (
+            <Alert severity="info" sx={{ mb: 1.5 }}>
+              该段已有执行登记（实际 {editingSession.execution.actualStartTime}
+              {editingSession.execution.actualEndTime ? `-${editingSession.execution.actualEndTime}` : ' 起'}
+              {typeof editingSession.execution.validFrames === 'number' ? `，有效 ${editingSession.execution.validFrames} 帧` : '，进行中'}）。编辑计划时段不会清除登记结果；若调整计划帧数或时段，保存后请重新核对短拍差额。
             </Alert>
           ) : null}
           {liveConflicts.length > 0 ? (
@@ -419,8 +568,15 @@ export default function SessionsPage() {
           <FieldRow label="计划帧数" required>
             <TextField size="small" type="number" fullWidth value={form.plannedFrames} onChange={(event) => setForm({ ...form, plannedFrames: Number(event.target.value) })} />
           </FieldRow>
-          <FieldRow label="状态">
-            <TextField select size="small" fullWidth value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as SessionStatus })}>
+          <FieldRow label="状态" hint={editingSession?.execution ? '该段状态由执行登记决定：只登记开始为「进行中」，完成登记为「已完成」，此处不可改' : undefined}>
+            <TextField
+              select
+              size="small"
+              fullWidth
+              disabled={Boolean(editingSession?.execution)}
+              value={form.status}
+              onChange={(event) => setForm({ ...form, status: event.target.value as SessionStatus })}
+            >
               {SESSION_STATUSES.map((status) => (
                 <MenuItem key={status} value={status}>
                   {status}
@@ -463,6 +619,47 @@ export default function SessionsPage() {
           <Button onClick={() => setRescheduleOpen(false)}>取消</Button>
           <Button variant="contained" color="warning" onClick={() => void submitReschedule()}>
             确认改期
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={execDialogOpen} onClose={() => setExecDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>执行登记{execSession ? ` · ${targetById(execSession.targetId)?.name ?? ''}（${execSession?.startTime}-${execSession?.endTime}，计划 ${execSession?.plannedFrames} 帧）` : ''}</DialogTitle>
+        <DialogContent>
+          {execError ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              {execError}
+            </Alert>
+          ) : null}
+          <Alert severity="info" sx={{ mb: 1.5 }}>
+            进行中的段可只填实际开始时间（结束时间与有效帧数留空），保存后标记为「进行中」；填写结束时间与有效帧数即为完成登记。未登记的段在总览与导出中显示「未登记」，不会用计划帧数顶替。
+          </Alert>
+          {execPreview?.finished && execPreview.short ? (
+            <Alert severity="warning" sx={{ mb: 1.5 }}>
+              检测到帧数不足或提前结束，请在下方填写短拍 / 提前结束原因后才能保存。
+            </Alert>
+          ) : null}
+          <FieldRow label="实际开始" required hint="HH:mm，可与计划开始不同">
+            <TextField size="small" fullWidth value={execForm.actualStartTime} onChange={(event) => setExecForm({ ...execForm, actualStartTime: event.target.value })} placeholder="20:05" />
+          </FieldRow>
+          <FieldRow label="实际结束" hint="HH:mm；进行中留空">
+            <TextField size="small" fullWidth value={execForm.actualEndTime} onChange={(event) => setExecForm({ ...execForm, actualEndTime: event.target.value })} placeholder="21:20" />
+          </FieldRow>
+          <FieldRow label="有效帧数" hint="实际入库有效帧；进行中留空，不要填计划帧数">
+            <TextField size="small" type="number" fullWidth value={execForm.validFrames} onChange={(event) => setExecForm({ ...execForm, validFrames: event.target.value })} placeholder={String(execSession?.plannedFrames ?? 0)} />
+          </FieldRow>
+          <FieldRow
+            label="短拍 / 提前结束原因"
+            required={Boolean(execPreview?.finished && execPreview.short)}
+            hint="有效帧数少于计划帧数，或实际时段短于计划时段（提前结束）时必填；例如：薄云过境导星丢失、设备故障、目标提前落下"
+          >
+            <TextField size="small" fullWidth multiline minRows={2} value={execForm.shortReason} onChange={(event) => setExecForm({ ...execForm, shortReason: event.target.value })} />
+          </FieldRow>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setExecDialogOpen(false)}>取消</Button>
+          <Button variant="contained" onClick={() => void submitExecution()}>
+            保存登记
           </Button>
         </DialogActions>
       </Dialog>

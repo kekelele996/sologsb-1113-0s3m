@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { db, deleteRow, persistRow, SCHEMA_VERSION } from '../hooks/usePersistentStore';
 import { uid } from '../utils/id';
-import type { ObsSession, SessionStatus } from '../types';
+import type { ExecutionRecord, ObsSession, SessionStatus } from '../types';
 
 export interface SessionInput {
   nightId: string;
@@ -15,6 +15,7 @@ export interface SessionInput {
   status: SessionStatus;
   rescheduleReason?: string;
   backupNightId?: string;
+  execution?: ExecutionRecord;
 }
 
 interface SessionState {
@@ -27,6 +28,10 @@ interface SessionState {
   /** 批量改期到备用观测夜并填写改期原因 */
   rescheduleToBackup: (ids: string[], backupNightId: string, reason: string) => Promise<number>;
   updateStatus: (id: string, status: SessionStatus) => Promise<void>;
+  /** 登记执行结果；完成登记自动置「已完成」，仅登记开始时间置「进行中」 */
+  registerExecution: (id: string, record: ExecutionRecord, finished: boolean) => Promise<void>;
+  /** 清除执行登记（同时回退排程状态：进行中/已完成 → 待执行） */
+  clearExecution: (id: string) => Promise<void>;
 }
 
 /** 排程段与冲突检测所需数据 */
@@ -53,6 +58,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       status: input.status,
       rescheduleReason: input.rescheduleReason?.trim() || undefined,
       backupNightId: input.backupNightId,
+      execution: input.execution,
       schemaVersion: SCHEMA_VERSION,
     };
     await persistRow('sessions', session);
@@ -63,7 +69,14 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   updateSession: async (id, patch) => {
     const current = get().sessions.find((session) => session.id === id);
     if (!current) return;
-    const next: ObsSession = { ...current, ...patch, schemaVersion: SCHEMA_VERSION };
+    // 编辑计划时段时保留已登记的执行结果与改期信息：patch 不带这些字段时沿用原值
+    const next: ObsSession = {
+      ...current,
+      ...patch,
+      execution: patch.execution !== undefined ? patch.execution : current.execution,
+      rescheduleReason: patch.rescheduleReason !== undefined ? patch.rescheduleReason?.trim() || undefined : current.rescheduleReason,
+      schemaVersion: SCHEMA_VERSION,
+    };
     await persistRow('sessions', next);
     set({ sessions: get().sessions.map((session) => (session.id === id ? next : session)) });
   },
@@ -91,5 +104,32 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
 
   updateStatus: async (id, status) => {
     await get().updateSession(id, { status });
+  },
+
+  registerExecution: async (id, record, finished) => {
+    const current = get().sessions.find((session) => session.id === id);
+    if (!current) return;
+    const next: ObsSession = {
+      ...current,
+      execution: record,
+      status: finished ? '已完成' : '进行中',
+      schemaVersion: SCHEMA_VERSION,
+    };
+    await persistRow('sessions', next);
+    set({ sessions: get().sessions.map((session) => (session.id === id ? next : session)) });
+  },
+
+  clearExecution: async (id) => {
+    const current = get().sessions.find((session) => session.id === id);
+    if (!current) return;
+    const next: ObsSession = {
+      ...current,
+      execution: undefined,
+      // 仅回退由登记驱动的状态；「因云取消」等状态不在此处改写
+      status: current.status === '已完成' || current.status === '进行中' ? '待执行' : current.status,
+      schemaVersion: SCHEMA_VERSION,
+    };
+    await persistRow('sessions', next);
+    set({ sessions: get().sessions.map((session) => (session.id === id ? next : session)) });
   },
 }));

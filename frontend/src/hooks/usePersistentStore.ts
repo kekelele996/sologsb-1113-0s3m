@@ -6,7 +6,7 @@ import type { Instrument, ObsNight, ObsSession, ObsTarget, Telescope } from '../
 export const DB_NAME = 'gbobsplan-db';
 
 /** 当前数据结构版本，写入每条记录并用于升级迁移判定 */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 class ObsPlanDB extends Dexie {
   targets!: Table<ObsTarget, string>;
@@ -53,6 +53,27 @@ class ObsPlanDB extends Dexie {
             if (!row.backupNightId && row.status === '因云取消' && backupNight) {
               row.backupNightId = backupNight.id;
             }
+          });
+      });
+
+    // v3：排程段增加执行登记 execution（实际开始/结束、有效帧数、短拍原因）。
+    // 不新增索引（execution 为嵌套对象），仅刷新 schemaVersion；旧数据一律视为「未登记」，
+    // 不允许用计划帧数顶替实际结果，由页面显式提示补录。
+    this.version(3)
+      .stores({
+        targets: 'id, name, catalog, type, priority, magnitude',
+        sessions: 'id, nightId, targetId, telescopeId, instrumentId, startTime, status, backupNightId',
+        telescopes: 'id, code, status',
+        instruments: 'id, model, telescopeCode, terminalType',
+        nights: 'id, date, siteName, primary, backup',
+        meta: 'key',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('sessions')
+          .toCollection()
+          .modify((row: ObsSession) => {
+            row.schemaVersion = SCHEMA_VERSION;
           });
       });
   }
@@ -116,17 +137,18 @@ const SEED_INSTRUMENTS: Instrument[] = [
   { id: 'ins-004', model: 'Shelyak Lhires III', terminalType: '光谱仪', pixelSizeUm: 9, sensorWidthMm: 8, sensorHeightMm: 6, readNoiseE: 4, telescopeCode: 'T-03' },
 ];
 
-/** 含一处同望远镜时段冲突（s-03 与 s-04 在 T-02 上重叠）与一条因云取消已改期记录 */
+/** 含一处同望远镜时段冲突（s-03 与 s-04 在 T-02 上重叠）与一条因云取消已改期记录；
+ *  执行登记样例覆盖：足额完成（s-01）、短拍带原因（s-02）、超额完成（s-09）、进行中只登记开始（s-03），其余未登记 */
 const SEED_SESSIONS: ObsSession[] = [
-  { id: 's-01', nightId: 'night-001', targetId: 'target-001', startTime: '18:20', endTime: '19:20', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION },
-  { id: 's-02', nightId: 'night-001', targetId: 'target-002', startTime: '19:30', endTime: '20:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 45, status: '已完成', schemaVersion: SCHEMA_VERSION },
-  { id: 's-03', nightId: 'night-001', targetId: 'target-004', startTime: '20:40', endTime: '22:10', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
+  { id: 's-01', nightId: 'night-001', targetId: 'target-001', startTime: '18:20', endTime: '19:20', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION, execution: { actualStartTime: '18:22', actualEndTime: '19:24', validFrames: 40, registeredAt: '2025-10-11T19:30:00+08:00' } },
+  { id: 's-02', nightId: 'night-001', targetId: 'target-002', startTime: '19:30', endTime: '20:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 45, status: '已完成', schemaVersion: SCHEMA_VERSION, execution: { actualStartTime: '19:31', actualEndTime: '20:12', validFrames: 27, shortReason: '19:50 起薄云过境，导星丢失，提前收摊，有效帧仅 27', registeredAt: '2025-10-11T20:20:00+08:00' } },
+  { id: 's-03', nightId: 'night-001', targetId: 'target-004', startTime: '20:40', endTime: '22:10', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'Ha', plannedFrames: 30, status: '进行中', schemaVersion: SCHEMA_VERSION, execution: { actualStartTime: '20:42', registeredAt: '2025-10-11T20:50:00+08:00' } },
   { id: 's-04', nightId: 'night-001', targetId: 'target-007', startTime: '21:30', endTime: '23:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 35, status: '待执行', schemaVersion: SCHEMA_VERSION, rescheduleReason: '与窄带目标争用 T-02，待改期' },
   { id: 's-05', nightId: 'night-001', targetId: 'target-009', startTime: '23:10', endTime: '00:20', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'OIII', plannedFrames: 28, status: '待执行', schemaVersion: SCHEMA_VERSION },
   { id: 's-06', nightId: 'night-001', targetId: 'target-008', startTime: '00:30', endTime: '02:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
   { id: 's-07', nightId: 'night-001', targetId: 'target-011', startTime: '02:10', endTime: '03:00', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 120, status: '待执行', schemaVersion: SCHEMA_VERSION },
   { id: 's-08', nightId: 'night-001', targetId: 'target-010', startTime: '03:10', endTime: '04:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: '无滤镜', plannedFrames: 300, status: '待执行', schemaVersion: SCHEMA_VERSION },
-  { id: 's-09', nightId: 'night-002', targetId: 'target-003', startTime: '18:30', endTime: '19:40', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION },
+  { id: 's-09', nightId: 'night-002', targetId: 'target-003', startTime: '18:30', endTime: '19:40', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: '无滤镜', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION, execution: { actualStartTime: '18:28', actualEndTime: '19:42', validFrames: 46, registeredAt: '2025-10-12T19:50:00+08:00' } },
   { id: 's-10', nightId: 'night-002', targetId: 'target-005', startTime: '19:50', endTime: '21:40', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 50, status: '待执行', schemaVersion: SCHEMA_VERSION },
   { id: 's-11', nightId: 'night-002', targetId: 'target-004', startTime: '21:50', endTime: '23:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'Ha', plannedFrames: 30, status: '因云取消', schemaVersion: SCHEMA_VERSION, rescheduleReason: '夜间云量转多云，目标被云遮挡，改期至备用夜', backupNightId: 'night-003' },
   { id: 's-12', nightId: 'night-002', targetId: 'target-012', startTime: '23:40', endTime: '01:00', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'SII', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION, rescheduleReason: '目标地平高度偏低，视情况顺延' },

@@ -1,6 +1,20 @@
 /** 排程段状态 */
 export type SessionStatus = '待执行' | '进行中' | '已完成' | '因云取消';
 
+/** 执行登记记录（观测结束后由值班员补录，独立于计划信息，编辑计划时段不会清除） */
+export interface ExecutionRecord {
+  /** 实际开始时刻 HH:mm */
+  actualStartTime: string;
+  /** 实际结束时刻 HH:mm（可跨零点）；进行中的段可先只登记开始时间，此时留空 */
+  actualEndTime?: string;
+  /** 有效帧数；完成登记时填写，进行中留空，禁止用计划帧数顶替 */
+  validFrames?: number;
+  /** 短拍 / 提前结束原因：帧数不足或实际时段短于计划时段时必填 */
+  shortReason?: string;
+  /** 最近一次登记时间 ISO 字符串 */
+  registeredAt: string;
+}
+
 /** 观测排程段 */
 export interface ObsSession {
   id: string;
@@ -26,6 +40,8 @@ export interface ObsSession {
   rescheduleReason?: string;
   /** 替补夜 ID（迁移时补齐） */
   backupNightId?: string;
+  /** 执行登记：无记录表示未登记，展示时不得用计划帧数顶替 */
+  execution?: ExecutionRecord;
   /** 数据结构版本 */
   schemaVersion: number;
 }
