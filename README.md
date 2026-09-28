@@ -26,7 +26,7 @@ docker compose down
 | UI | MUI（Material UI 5）+ Emotion |
 | 路由 | React Router 6（5 条业务路由 + 404） |
 | 状态 | Zustand（targetStore / sessionStore / equipmentStore / nightStore） |
-| 存储 | IndexedDB（Dexie，库名 `gbobsplan-db`，`schemaVersion` + v2 迁移） |
+| 存储 | IndexedDB（Dexie，库名 `gbobsplan-db`，`schemaVersion` + v3 迁移） |
 | 托管 | nginx:alpine（多阶段构建，SPA try_files + gzip） |
 
 ## 本地开发
@@ -62,15 +62,17 @@ npm run build    # 类型检查 + 生产构建
 
 | 路由 | 页面 | 说明 |
 | --- | --- | --- |
-| `/` | 本夜编排总览 | 30 分钟刻度时间轴 + 月相与月出月落条带；冲突与低于高度阈值的目标自动标灰 |
+| `/` | 本夜编排总览 | 30 分钟刻度时间轴 + 月相与月出月落条带；冲突与低于高度阈值的目标自动标灰；按实际结果汇总有效帧数与短拍差额，未登记排程段明确标注 |
 | `/targets` | 观测目标库 | 按类型与优先级筛选、按视星等排序、维护地平高度阈值与曝光参数，并给出本夜可见窗口 |
-| `/sessions` | 排程段与冲突 | 冲突检测结果、按时段/望远镜校验，勾选多条批量改期到备用观测夜并填写改期原因 |
+| `/sessions` | 排程段与冲突 | 冲突检测结果、按时段/望远镜校验，勾选多条批量改期到备用观测夜并填写改期原因；观测结束后逐段执行登记（实际起止、有效帧数、短拍/提前结束原因） |
 | `/equipment` | 设备分配视图 | 行 = 望远镜、列 = 30 分钟时段；冲突格标红，点击可一键跳转到对应排程段 |
-| `/export` | 导出观测清单 | 目标、时刻、滤镜、帧数导出为文本与 CSV，支持打印视图 |
+| `/export` | 导出观测清单 | 目标、计划与实际时刻、滤镜、计划/有效帧数、短拍差额导出为文本与 CSV，支持打印视图；未登记段显式标注、不以计划帧数顶替 |
 
 ## 数据存储说明
 
 - 全部数据存于浏览器 IndexedDB（Dexie，库名 `gbobsplan-db`），表：`targets`、`sessions`、`telescopes`、`instruments`、`nights`、`meta`。
 - `db.version(1).stores({...})` 声明索引；`db.version(2).upgrade(...)` 为排程段增加 `backupNightId` 索引，并给旧数据补齐 `schemaVersion` 与因云取消排程段的替补夜。
-- 首次打开且表为空时写入示例数据（12 个观测目标、5 个观测夜、4 台望远镜、4 台终端、14 段排程，含 1 处设备冲突与 1 条改期记录）。
+- `db.version(3).upgrade(...)` 为排程段增加执行登记字段（`actualStartTime` / `actualEndTime` / `actualFrames` / `shortReason`，无新增索引）；历史排程一律视为「未登记」，不以计划帧数顶替实际帧数。
+- 执行登记规则：进行中的段可只录实际开始时间；结束后补录实际起止与有效帧数；有效帧数不足计划帧数或实际提前结束时必须填写短拍 / 提前结束原因；编辑计划时段不会覆盖已登记结果。
+- 首次打开且表为空时写入示例数据（12 个观测目标、5 个观测夜、4 台望远镜、4 台终端、14 段排程，含 1 处设备冲突、1 条改期记录与 3 条执行登记：足额 / 短拍提前结束 / 进行中）。
 - 容器无状态：不使用数据库服务、不挂载命名卷，`docker compose down` 后数据仍留在浏览器中。

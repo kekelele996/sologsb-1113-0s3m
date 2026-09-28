@@ -18,7 +18,7 @@ import { useNightStore } from '../stores/nightStore';
 import { useSessionStore } from '../stores/sessionStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
+import { NIGHT_TOTAL_MINUTES, TARGET_COLOR, endedEarly, frameShortfall, hasExecutionRecord, isExecutionComplete } from '../types';
 import { altitudeAt, axisMinutes, isBelowThreshold, minutesToTime, moonBrightnessFactor, moonConflict, moonPhaseText, timelineTicks } from '../utils/astro';
 
 /** 本夜编排总览：30 分钟刻度时间轴 + 月相与月出月落条带 + 冲突与标灰提示 */
@@ -62,6 +62,14 @@ export default function OverviewPage() {
         const startMinute = Math.max(0, Math.min(NIGHT_TOTAL_MINUTES, axisMinutes(session.startTime)));
         const rawEnd = axisMinutes(session.endTime);
         const endMinute = Math.max(startMinute + 20, Math.min(NIGHT_TOTAL_MINUTES, rawEnd <= startMinute ? rawEnd + 1440 : rawEnd));
+        const registered = hasExecutionRecord(session);
+        const complete = isExecutionComplete(session);
+        const shortfall = complete ? frameShortfall(session) : 0;
+        const executionText = registered
+          ? complete
+            ? `｜实际 ${session.actualStartTime}-${session.actualEndTime}｜有效 ${session.actualFrames}/${session.plannedFrames} 帧${shortfall > 0 ? `（短拍 -${shortfall}）` : ''}`
+            : `｜实际开始 ${session.actualStartTime}（进行中，结束与帧数未登记）`
+          : '｜执行未登记';
         return {
           id: session.id,
           startMinute,
@@ -71,13 +79,18 @@ export default function OverviewPage() {
           dimmed: session.status === '因云取消' || Boolean(altitude?.below),
           tooltip: `${session.startTime}-${session.endTime} ${target?.name ?? ''}｜${telescopeById(session.telescopeId)?.code ?? '-'} / ${
             instrumentById(session.instrumentId)?.model ?? '-'
-          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}｜评估高度角 ${altitude?.altitude ?? '-'}°`,
+          }｜${session.filterSlot}｜计划 ${session.plannedFrames} 帧｜${session.status}${executionText}｜评估高度角 ${altitude?.altitude ?? '-'}°`,
         };
       }),
     [nightSessions, targets, altitudes, telescopes, instruments],
   );
 
   const totalFrames = nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0);
+  const registeredSessions = useMemo(() => nightSessions.filter(hasExecutionRecord), [nightSessions]);
+  const completedExecutions = useMemo(() => nightSessions.filter(isExecutionComplete), [nightSessions]);
+  const actualFramesTotal = completedExecutions.reduce((sum, session) => sum + (session.actualFrames ?? 0), 0);
+  const shortfallTotal = completedExecutions.reduce((sum, session) => sum + frameShortfall(session), 0);
+  const unregisteredCount = nightSessions.length - registeredSessions.length;
   const dimmedTargets = useMemo(
     () => Array.from(new Set(nightSessions.map((session) => session.targetId))).filter((id) => altitudes.get(id)?.below),
     [nightSessions, altitudes],
@@ -120,13 +133,24 @@ export default function OverviewPage() {
         <ConflictBadge conflicts={conflicts} />
       </Stack>
 
-      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' }, gap: 2, mb: 2 }}>
+      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(3, 1fr)' }, gap: 2, mb: 2 }}>
         <Card variant="outlined">
           <CardContent>
             <Typography variant="caption" color="text.secondary">
-              本夜排程段
+              本夜排程段（已登记 / 总数）
             </Typography>
-            <Typography variant="h5">{nightSessions.length}</Typography>
+            <Typography variant="h5">
+              {registeredSessions.length} / {nightSessions.length}
+            </Typography>
+            {unregisteredCount > 0 ? (
+              <Typography variant="caption" color="text.secondary">
+                {unregisteredCount} 段未登记
+              </Typography>
+            ) : (
+              <Typography variant="caption" color="success.main">
+                全部已登记
+              </Typography>
+            )}
           </CardContent>
         </Card>
         <Card variant="outlined">
@@ -135,6 +159,42 @@ export default function OverviewPage() {
               计划帧数
             </Typography>
             <Typography variant="h5">{totalFrames}</Typography>
+          </CardContent>
+        </Card>
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">
+              实际有效帧数（{completedExecutions.length} 段已完结）
+            </Typography>
+            <Typography variant="h5" color={shortfallTotal > 0 ? 'warning.main' : 'success.main'}>
+              {completedExecutions.length > 0 ? actualFramesTotal : '—'}
+            </Typography>
+            {completedExecutions.length === 0 ? (
+              <Typography variant="caption" color="text.secondary">
+                暂无完结登记
+              </Typography>
+            ) : shortfallTotal > 0 ? (
+              <Typography variant="caption" color="error.main">
+                短拍差额 -{shortfallTotal} 帧
+              </Typography>
+            ) : (
+              <Typography variant="caption" color="success.main">
+                已完结段均足额
+              </Typography>
+            )}
+          </CardContent>
+        </Card>
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">
+              短拍差额合计
+            </Typography>
+            <Typography variant="h5" color={shortfallTotal ? 'error.main' : 'success.main'}>
+              {completedExecutions.length > 0 ? shortfallTotal : '—'}
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              计划 − 有效，未登记不计入
+            </Typography>
           </CardContent>
         </Card>
         <Card variant="outlined">
@@ -250,19 +310,50 @@ export default function OverviewPage() {
             .map((session) => {
               const target = targetById(session.targetId);
               const altitude = altitudes.get(session.targetId);
+              const registered = hasExecutionRecord(session);
+              const complete = isExecutionComplete(session);
+              const shortfall = complete ? frameShortfall(session) : 0;
+              const early = complete ? endedEarly(session) : false;
               return (
                 <Card key={session.id} variant="outlined">
                   <CardContent sx={{ py: 1.25, '&:last-child': { pb: 1.25 } }}>
-                    <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap">
+                    <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap" useFlexGap>
                       <Chip size="small" label={`${session.startTime}-${session.endTime}`} />
                       <Typography variant="subtitle2">{target ? `${target.name}（${target.catalog}）` : '未知目标'}</Typography>
                       <Chip size="small" variant="outlined" label={`${telescopeById(session.telescopeId)?.code ?? '-'} / ${instrumentById(session.instrumentId)?.model ?? '-'}`} />
                       <Chip size="small" variant="outlined" label={`滤镜 ${session.filterSlot}`} />
-                      <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧 × ${target?.exposureSec ?? '-'}s`} />
+                      <Chip size="small" variant="outlined" label={`计划 ${session.plannedFrames} 帧 × ${target?.exposureSec ?? '-'}s`} />
                       <StatusChip status={session.status} />
                       {ids.has(session.id) ? <Chip size="small" color="error" label="时段冲突" /> : null}
                       {altitude?.below ? <Chip size="small" color="warning" label={`高度角 ${altitude.altitude}° 低于阈值 ${target?.minAltitude}°`} /> : <Chip size="small" color="success" variant="outlined" label={`高度角 ${altitude?.altitude ?? '-'}°`} />}
-                      {session.rescheduleReason ? <Typography variant="caption" color="text.secondary">{session.rescheduleReason}</Typography> : null}
+                    </Stack>
+                    <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mt: 0.75 }}>
+                      {!registered ? (
+                        <Chip size="small" variant="outlined" color="default" label="执行未登记（不计入实际帧数）" />
+                      ) : complete ? (
+                        <>
+                          <Chip size="small" color="primary" variant="outlined" label={`实际 ${session.actualStartTime}-${session.actualEndTime}`} />
+                          <Chip size="small" color={shortfall > 0 ? 'error' : 'success'} variant="outlined" label={shortfall > 0 ? `有效 ${session.actualFrames} 帧 · 短拍 -${shortfall}` : `有效 ${session.actualFrames} 帧 · 足额`} />
+                          {early ? <Chip size="small" color="warning" label="提前结束" /> : null}
+                          {session.shortReason ? (
+                            <Typography variant="caption" color="text.secondary">
+                              原因：{session.shortReason}
+                            </Typography>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          <Chip size="small" color="primary" label={`实际开始 ${session.actualStartTime} · 进行中`} />
+                          <Typography variant="caption" color="text.secondary">
+                            结束时间与有效帧数待补录
+                          </Typography>
+                        </>
+                      )}
+                      {session.rescheduleReason ? (
+                        <Typography variant="caption" color="text.secondary">
+                          改期：{session.rescheduleReason}
+                        </Typography>
+                      ) : null}
                     </Stack>
                   </CardContent>
                 </Card>

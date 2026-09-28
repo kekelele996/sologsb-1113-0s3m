@@ -17,7 +17,7 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
+import { NIGHT_TOTAL_MINUTES, TARGET_COLOR, endedEarly, frameShortfall, hasExecutionRecord, isExecutionComplete } from '../types';
 import { axisMinutes, timelineTicks } from '../utils/astro';
 import { buildNightPlanText, buildPlanCsv, downloadText, printPage } from '../utils/export';
 
@@ -54,6 +54,9 @@ export default function ExportPage() {
         const target = targets.find((item) => item.id === session.targetId);
         const startMinute = Math.max(0, Math.min(NIGHT_TOTAL_MINUTES, axisMinutes(session.startTime)));
         const rawEnd = axisMinutes(session.endTime);
+        const registered = hasExecutionRecord(session);
+        const complete = isExecutionComplete(session);
+        const shortfall = complete ? frameShortfall(session) : 0;
         return {
           id: session.id,
           startMinute,
@@ -61,11 +64,22 @@ export default function ExportPage() {
           label: target?.name ?? '未知目标',
           color: target ? TARGET_COLOR[target.type] : '#607d8b',
           dimmed: session.status === '因云取消',
-          tooltip: `${session.startTime}-${session.endTime} · ${session.filterSlot} · ${session.plannedFrames} 帧 · ${session.status}`,
+          tooltip: `${session.startTime}-${session.endTime} · ${session.filterSlot} · 计划 ${session.plannedFrames} 帧 · ${session.status}${
+            registered
+              ? complete
+                ? ` · 实际 ${session.actualStartTime}-${session.actualEndTime} · 有效 ${session.actualFrames} 帧${shortfall > 0 ? ` · 短拍 -${shortfall}` : ''}`
+                : ` · 实际开始 ${session.actualStartTime}（进行中）`
+              : ' · 执行未登记'
+          }`,
         };
       }),
     [nightSessions, targets],
   );
+
+  const registeredCount = nightSessions.filter(hasExecutionRecord).length;
+  const completedExecutions = nightSessions.filter(isExecutionComplete);
+  const actualFramesTotal = completedExecutions.reduce((sum, session) => sum + (session.actualFrames ?? 0), 0);
+  const shortfallTotal = completedExecutions.reduce((sum, session) => sum + frameShortfall(session), 0);
 
   return (
     <Box>
@@ -92,6 +106,13 @@ export default function ExportPage() {
         </TextField>
         <Chip size="small" label={`排程段 ${nightSessions.length}`} />
         <Chip size="small" label={`计划帧数合计 ${nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0)}`} />
+        <Chip size="small" color="primary" variant="outlined" label={`已登记 ${registeredCount} / ${nightSessions.length}，未登记 ${nightSessions.length - registeredCount}`} />
+        <Chip
+          size="small"
+          color={shortfallTotal > 0 ? 'error' : 'default'}
+          variant={shortfallTotal > 0 ? 'filled' : 'outlined'}
+          label={completedExecutions.length > 0 ? `实际有效 ${actualFramesTotal} 帧 · 短拍差额 ${shortfallTotal}` : '实际有效帧数：暂无完结登记'}
+        />
         <ConflictBadge conflicts={conflicts} />
         <Button
           variant="contained"
@@ -132,21 +153,43 @@ export default function ExportPage() {
         </Paper>
         <Paper variant="outlined" sx={{ p: 2 }}>
           <Typography variant="subtitle1" sx={{ mb: 1 }}>
-            排程段状态核对
+            排程段执行核对
           </Typography>
           <Stack spacing={1}>
             {[...nightSessions]
               .sort((a, b) => axisMinutes(a.startTime) - axisMinutes(b.startTime))
               .map((session) => {
                 const target = targets.find((item) => item.id === session.targetId);
+                const registered = hasExecutionRecord(session);
+                const complete = isExecutionComplete(session);
+                const shortfall = complete ? frameShortfall(session) : 0;
+                const early = complete ? endedEarly(session) : false;
                 return (
-                  <Stack key={session.id} direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                    <Chip size="small" label={`${session.startTime}-${session.endTime}`} />
-                    <Typography variant="body2">{target?.name ?? '未知目标'}</Typography>
-                    <Chip size="small" variant="outlined" label={session.filterSlot} />
-                    <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧`} />
-                    <StatusChip status={session.status} />
-                  </Stack>
+                  <Box key={session.id}>
+                    <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                      <Chip size="small" label={`${session.startTime}-${session.endTime}`} />
+                      <Typography variant="body2">{target?.name ?? '未知目标'}</Typography>
+                      <Chip size="small" variant="outlined" label={session.filterSlot} />
+                      <Chip size="small" variant="outlined" label={`计划 ${session.plannedFrames} 帧`} />
+                      <StatusChip status={session.status} />
+                      {!registered ? (
+                        <Chip size="small" variant="outlined" label="执行未登记" />
+                      ) : complete ? (
+                        <>
+                          <Chip size="small" color="primary" variant="outlined" label={`实际 ${session.actualStartTime}-${session.actualEndTime}`} />
+                          <Chip size="small" color={shortfall > 0 ? 'error' : 'success'} variant="outlined" label={shortfall > 0 ? `有效 ${session.actualFrames}（短拍 -${shortfall}）` : `有效 ${session.actualFrames}（足额）`} />
+                          {early ? <Chip size="small" color="warning" label="提前结束" /> : null}
+                        </>
+                      ) : (
+                        <Chip size="small" color="primary" label={`实际开始 ${session.actualStartTime} · 进行中`} />
+                      )}
+                    </Stack>
+                    {complete && session.shortReason ? (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.25, ml: 1 }}>
+                        原因：{session.shortReason}
+                      </Typography>
+                    ) : null}
+                  </Box>
                 );
               })}
             {nightSessions.length === 0 ? (
